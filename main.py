@@ -454,6 +454,7 @@ class MainWindow(QMainWindow):
         title=QLabel('日历视图');title.setObjectName('heading');chead.addWidget(title);chead.addStretch()
         today=QPushButton('今天');today.clicked.connect(self.go_today);chead.addWidget(today)
         self.calendar=NoteCalendar();self.calendar.setGridVisible(True);self.calendar.setNavigationBarVisible(True)
+        self.calendar.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
         self.calendar.selectionChanged.connect(lambda:self.show_date_notes(self.calendar.selectedDate()))
         self.calendar.currentPageChanged.connect(lambda *_:self.refresh_calendar())
         cl.addWidget(self.calendar,2)
