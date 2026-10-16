@@ -15,7 +15,7 @@ from datetime import datetime, date
 from html import escape
 
 from PySide6.QtCore import Qt, QDate, QDateTime, QTimer, QSize, QEvent, QObject, QAbstractNativeEventFilter, Signal
-from PySide6.QtGui import (QIcon, QColor, QFont, QTextCharFormat, QTextCursor, QTextListFormat, QBrush,
+from PySide6.QtGui import (QIcon, QColor, QFont, QTextCharFormat, QTextCursor, QTextListFormat, QPainter,
                            QAction, QKeySequence, QTextImageFormat, QGuiApplication)
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QFrame, QHBoxLayout, QVBoxLayout,
     QGridLayout, QPushButton, QLabel, QLineEdit, QTextEdit, QListWidget, QListWidgetItem,
@@ -398,7 +398,7 @@ class NoteCalendar(QCalendarWidget):
         count=self.note_counts.get(day.toString('yyyy-MM-dd'),0)
         if not count:return
         painter.save()
-        painter.setRenderHint(painter.RenderHint.Antialiasing,True)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing,True)
         # Small colored count badge in top right; remains visible on selected dates.
         badge=rect.adjusted(rect.width()-33,4,-4,-rect.height()+23)
         painter.setPen(Qt.PenStyle.NoPen)
