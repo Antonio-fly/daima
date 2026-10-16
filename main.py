@@ -15,14 +15,14 @@ from datetime import datetime, date
 from html import escape
 
 from PySide6.QtCore import Qt, QDate, QDateTime, QTimer, QSize, QEvent, QObject, QAbstractNativeEventFilter, Signal
-from PySide6.QtGui import (QIcon, QColor, QFont, QTextCharFormat, QTextCursor, QTextListFormat,
+from PySide6.QtGui import (QIcon, QColor, QFont, QTextCharFormat, QTextCursor, QTextListFormat, QBrush,
                            QAction, QKeySequence, QTextImageFormat, QGuiApplication)
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QFrame, QHBoxLayout, QVBoxLayout,
     QGridLayout, QPushButton, QLabel, QLineEdit, QTextEdit, QListWidget, QListWidgetItem,
     QCalendarWidget, QSplitter, QComboBox, QMenu, QMessageBox, QColorDialog, QInputDialog,
     QFileDialog, QSystemTrayIcon, QStyle, QToolBar, QDialog, QDialogButtonBox, QFormLayout,
     QSpinBox, QSlider, QCheckBox, QScrollArea, QDateTimeEdit, QStackedWidget, QFontComboBox,
-    QTextBrowser, QGraphicsOpacityEffect)
+    QTextBrowser, QGraphicsOpacityEffect, QDateEdit)
 
 APP_NAME = '牛马便签'
 CATEGORIES = [('工作','#33a2e6'),('生活','#43ad5c'),('学习','#9d65dd'),('待办','#f9ac23'),('灵感','#ef7094'),('个人成长','#f1c841')]
@@ -67,13 +67,22 @@ class Store:
           FOREIGN KEY(note_id) REFERENCES notes(id));
         CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated);
         ''')
+        # Preserve existing databases. Existing notes keep their original creation day,
+        # never the last-edit day, as their initial calendar association.
+        columns={row[1] for row in self.conn.execute('PRAGMA table_info(notes)')}
+        if 'note_date' not in columns:
+            self.conn.execute("ALTER TABLE notes ADD COLUMN note_date TEXT NOT NULL DEFAULT ''")
+            self.conn.execute("UPDATE notes SET note_date=substr(created,1,10) WHERE note_date=''")
+            self.conn.commit()
+        self.conn.execute("UPDATE notes SET note_date=substr(created,1,10) WHERE note_date=''")
         self.conn.commit()
 
-    def add(self, title='新便签', category='工作', color=None):
+    def add(self, title='新便签', category='工作', color=None, note_date=None):
         nid = uuid.uuid4().hex
         now = datetime.now().isoformat(timespec='seconds')
-        self.conn.execute('INSERT INTO notes(id,title,category,color,created,updated) VALUES(?,?,?,?,?,?)',
-                          (nid,title,category,color or NOTE_COLORS[len(self.all()) % len(NOTE_COLORS)],now,now))
+        chosen=note_date or now[:10]
+        self.conn.execute('INSERT INTO notes(id,title,category,color,note_date,created,updated) VALUES(?,?,?,?,?,?,?)',
+                          (nid,title,category,color or NOTE_COLORS[len(self.all()) % len(NOTE_COLORS)],chosen,now,now))
         self.conn.commit()
         return nid
 
@@ -95,7 +104,7 @@ class Store:
         return [dict(r) for r in self.conn.execute(sql,vals)]
 
     def update(self, nid, **fields):
-        valid = {'title','html','content','category','tags','color','opacity','pinned','archived','trashed',
+        valid = {'title','html','content','category','tags','color','opacity','pinned','archived','trashed','note_date',
                  'reminder','reminded','x','y','w','h'}
         fields = {k:v for k,v in fields.items() if k in valid}
         if not fields: return
@@ -251,6 +260,10 @@ class Editor(QWidget):
         meta=QHBoxLayout();root.addLayout(meta)
         self.category=QComboBox();self.category.addItems([x[0] for x in CATEGORIES]);meta.addWidget(QLabel('分类'));meta.addWidget(self.category)
         self.tags=QLineEdit();self.tags.setPlaceholderText('标签：多个用逗号分隔');meta.addWidget(self.tags,2)
+        meta.addWidget(QLabel('事项日期'))
+        self.note_date=QDateEdit(QDate.currentDate());self.note_date.setCalendarPopup(True)
+        self.note_date.setDisplayFormat('yyyy-MM-dd');self.note_date.setToolTip('便签所属日期，修改后将在日历中同步移动')
+        meta.addWidget(self.note_date)
         colorbtn=QPushButton('🎨 背景');colorbtn.clicked.connect(self.pick_color);meta.addWidget(colorbtn)
         meta.addWidget(QLabel('透明度'))
         self.opacity=QSlider(Qt.Orientation.Horizontal);self.opacity.setRange(35,100);self.opacity.setFixedWidth(78);meta.addWidget(self.opacity)
@@ -279,6 +292,7 @@ class Editor(QWidget):
         self.opacity.valueChanged.connect(self.schedule)
         self.reminder_on.toggled.connect(self.schedule)
         self.reminder_at.dateTimeChanged.connect(self.schedule)
+        self.note_date.dateChanged.connect(self.schedule)
         self.setEnabled(False)
 
     def schedule(self,*_):
@@ -294,6 +308,8 @@ class Editor(QWidget):
         self.restore.setVisible(bool(n['archived'] or n['trashed']))
         self.delete.setText('永久删除' if n['trashed'] else '删除')
         self.title.setText(n['title']);self.category.setCurrentText(n['category']);self.tags.setText(n['tags'])
+        parsed_date=QDate.fromString(n['note_date'],'yyyy-MM-dd')
+        self.note_date.setDate(parsed_date if parsed_date.isValid() else QDate.currentDate())
         self.body.setHtml(n['html'] or '');self.opacity.setValue(n['opacity']);self.pin.setText('★ 已收藏' if n['pinned'] else '☆ 收藏')
         self.reminder_on.setChecked(bool(n['reminder']))
         if n['reminder']:
@@ -310,7 +326,8 @@ class Editor(QWidget):
         current=self.owner.store.get(self.nid)
         self.owner.store.update(self.nid,title=self.title.text() or '无标题',html=self.body.toHtml(),
             content=self.body.toPlainText(),category=self.category.currentText(),tags=self.tags.text(),
-            opacity=self.opacity.value(),reminder=reminder,reminded=0 if reminder!=current['reminder'] else current['reminded'])
+            opacity=self.opacity.value(),note_date=self.note_date.date().toString('yyyy-MM-dd'),
+            reminder=reminder,reminded=0 if reminder!=current['reminder'] else current['reminded'])
         self.status.setText('✓ 已保存 · '+datetime.now().strftime('%H:%M:%S'))
         self.owner.reload_list(keep=True);self.owner.refresh_calendar()
     def format_toggle(self,key):
@@ -370,6 +387,29 @@ class Editor(QWidget):
         if self.nid:self.owner.move_to_trash(self.nid)
 
 
+class NoteCalendar(QCalendarWidget):
+    """Calendar with persistent visual markers based on note_date, not updated."""
+    def __init__(self,parent=None):
+        super().__init__(parent)
+        self.note_counts={}
+
+    def paintCell(self,painter,rect,day):
+        super().paintCell(painter,rect,day)
+        count=self.note_counts.get(day.toString('yyyy-MM-dd'),0)
+        if not count:return
+        painter.save()
+        painter.setRenderHint(painter.RenderHint.Antialiasing,True)
+        # Small colored count badge in top right; remains visible on selected dates.
+        badge=rect.adjusted(rect.width()-33,4,-4,-rect.height()+23)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor('#368b50'))
+        painter.drawRoundedRect(badge,8,8)
+        painter.setPen(QColor('#ffffff'))
+        font=painter.font();font.setBold(True);font.setPointSize(8);painter.setFont(font)
+        painter.drawText(badge,Qt.AlignmentFlag.AlignCenter,str(count) if count<100 else '99+')
+        painter.restore()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -412,10 +452,17 @@ class MainWindow(QMainWindow):
         calpage=QWidget();self.stack.addWidget(calpage);cl=QVBoxLayout(calpage);cl.setContentsMargins(12,0,12,12)
         chead=QHBoxLayout();cl.addLayout(chead)
         title=QLabel('日历视图');title.setObjectName('heading');chead.addWidget(title);chead.addStretch()
-        today=QPushButton('今天');today.clicked.connect(lambda:self.calendar.setSelectedDate(QDate.currentDate()));chead.addWidget(today)
-        self.calendar=QCalendarWidget();self.calendar.setGridVisible(True);self.calendar.setNavigationBarVisible(True)
-        self.calendar.clicked.connect(self.show_date_notes);self.calendar.currentPageChanged.connect(lambda *_:self.refresh_calendar());cl.addWidget(self.calendar,2)
-        cl.addWidget(QLabel('当日记录和提醒'))
+        today=QPushButton('今天');today.clicked.connect(self.go_today);chead.addWidget(today)
+        self.calendar=NoteCalendar();self.calendar.setGridVisible(True);self.calendar.setNavigationBarVisible(True)
+        self.calendar.selectionChanged.connect(lambda:self.show_date_notes(self.calendar.selectedDate()))
+        self.calendar.currentPageChanged.connect(lambda *_:self.refresh_calendar())
+        cl.addWidget(self.calendar,2)
+        daybar=QHBoxLayout();cl.addLayout(daybar)
+        self.day_heading=QLabel('当日便签事项');daybar.addWidget(self.day_heading);daybar.addStretch()
+        self.add_day=QPushButton('＋ 在所选日期新建便签');self.add_day.setObjectName('primary')
+        self.add_day.clicked.connect(self.new_calendar_note);daybar.addWidget(self.add_day)
+        self.calendar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.calendar.customContextMenuRequested.connect(self.calendar_context_menu)
         self.day_notes=QListWidget();self.day_notes.itemDoubleClicked.connect(self.calendar_open_note);cl.addWidget(self.day_notes,1)
         self.tray=QSystemTrayIcon(self.icon,self);self.tray.setToolTip(APP_NAME+' · Ctrl+Alt+N 或双击 F12 唤醒/隐藏')
         menu=QMenu();a=menu.addAction('显示主窗口');a.triggered.connect(self.show_normal)
@@ -468,6 +515,16 @@ class MainWindow(QMainWindow):
         ''')
 
     def show_calendar(self):self.stack.setCurrentIndex(1);self.refresh_calendar()
+    def go_today(self):
+        self.calendar.setCurrentPage(QDate.currentDate().year(),QDate.currentDate().month())
+        self.calendar.setSelectedDate(QDate.currentDate())
+        self.show_date_notes(self.calendar.selectedDate())
+    def calendar_context_menu(self,point):
+        menu=QMenu(self)
+        menu.addAction('在选中日期新建便签',self.new_calendar_note)
+        menu.exec(self.calendar.mapToGlobal(point))
+    def new_calendar_note(self):
+        self.new_note(note_date=self.calendar.selectedDate().toString('yyyy-MM-dd'))
     def change_mode(self,mode):
         self.mode=mode;self.selected_category='全部';self.heading.setText({'active':'全部笔记','archive':'归档','trash':'回收站'}[mode]);self.stack.setCurrentIndex(0);self.reload_list()
     def favorites(self):self.change_mode('active');self.reload_list(favorites=True)
@@ -493,9 +550,11 @@ class MainWindow(QMainWindow):
         for i in range(self.list.count()):
             if self.list.item(i).data(Qt.ItemDataRole.UserRole)==nid:
                 self.list.setCurrentRow(i);return
-    def new_note(self):
+    def new_note(self,checked=False,note_date=None):
+        # Qt clicked(bool) passes checked; ignore it to keep sidebar 'new' using today.
+        selected=note_date if isinstance(note_date,str) else date.today().isoformat()
         category=self.selected_category if self.selected_category!='全部' else '工作'
-        nid=self.store.add('新便签',category);self.mode='active';self.selected_category='全部';self.stack.setCurrentIndex(0)
+        nid=self.store.add('新便签',category,note_date=selected);self.mode='active';self.selected_category='全部';self.stack.setCurrentIndex(0)
         self.reload_list();self.select_id(nid);self.editor.title.selectAll();self.editor.title.setFocus()
     def move_to_trash(self,nid):
         n=self.store.get(nid)
@@ -526,25 +585,24 @@ class MainWindow(QMainWindow):
     def update_sticky(self,nid):
         if nid in self.stickies:self.stickies[nid].refresh_color()
     def refresh_calendar(self):
+        counts={}
+        for n in self.store.all('all'):
+            day=n['note_date']
+            counts[day]=counts.get(day,0)+1
+        self.calendar.note_counts=counts
+        self.calendar.updateCells()
         self.show_date_notes(self.calendar.selectedDate())
-        # Bold dates carrying a note reminder or updated note.
-        from PySide6.QtGui import QTextCharFormat
-        ordinary=QTextCharFormat();marked=QTextCharFormat();marked.setFontWeight(QFont.Weight.Bold);marked.setForeground(QColor('#267e3c'))
-        year,month=self.calendar.yearShown(),self.calendar.monthShown()
-        dates=set()
-        for n in self.store.all('all'):
-            for value in [n['reminder'][:10],n['updated'][:10]]:
-                if value.startswith(f'{year:04d}-{month:02d}'):
-                    try:dates.add(int(value[-2:]))
-                    except ValueError:pass
-        for day in range(1,calendar.monthrange(year,month)[1]+1):
-            self.calendar.setDateTextFormat(QDate(year,month,day),marked if day in dates else ordinary)
+
     def show_date_notes(self,qdate):
-        self.day_notes.clear();day=qdate.toString('yyyy-MM-dd')
-        for n in self.store.all('all'):
-            if n['reminder'].startswith(day) or n['updated'].startswith(day):
-                it=QListWidgetItem(('⏰ ' if n['reminder'].startswith(day) else '📝 ')+n['title']+' · '+n['category'])
-                it.setData(Qt.ItemDataRole.UserRole,n['id']);self.day_notes.addItem(it)
+        if not hasattr(self,'day_notes'):return
+        self.day_notes.clear()
+        day=qdate.toString('yyyy-MM-dd')
+        notes=[n for n in self.store.all('all') if n['note_date']==day]
+        self.day_heading.setText(day+'  ·  '+str(len(notes))+' 条便签')
+        for n in notes:
+            it=QListWidgetItem(('★ ' if n['pinned'] else '📝 ')+n['title']+' · '+n['category'])
+            it.setData(Qt.ItemDataRole.UserRole,n['id'])
+            self.day_notes.addItem(it)
     def calendar_open_note(self,it):self.select_id(it.data(Qt.ItemDataRole.UserRole))
     def check_reminders(self):
         now=datetime.now().strftime('%Y-%m-%d %H:%M')
