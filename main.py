@@ -121,14 +121,14 @@ class HotkeyFilter(QAbstractNativeEventFilter):
     """RegisterHotKey -> WM_HOTKEY; Windows prevents duplicate key delivery."""
     triggered = None
     def nativeEventFilter(self, eventType, message):
-        if sys.platform != 'win32' or eventType != b'windows_generic_MSG': return False, 0
+        if sys.platform != 'win32' or eventType not in (b'windows_generic_MSG', b'windows_dispatcher_MSG'): return False, 0
         from ctypes import wintypes
         class MSG(ctypes.Structure):
             _fields_ = [('hwnd',wintypes.HWND),('message',wintypes.UINT),('wParam',wintypes.WPARAM),
                         ('lParam',wintypes.LPARAM),('time',wintypes.DWORD),('pt',wintypes.POINT)]
         m = MSG.from_address(int(message))
-        if m.message == 0x0312 and m.wParam == 0xB120:
-            if self.triggered: self.triggered()
+        if m.message == 0x0312 and m.wParam in (0xB120, 0xB121):
+            if self.triggered: self.triggered(int(m.wParam))
             return True,0
         return False,0
 
@@ -417,18 +417,28 @@ class MainWindow(QMainWindow):
         self.calendar.clicked.connect(self.show_date_notes);self.calendar.currentPageChanged.connect(lambda *_:self.refresh_calendar());cl.addWidget(self.calendar,2)
         cl.addWidget(QLabel('当日记录和提醒'))
         self.day_notes=QListWidget();self.day_notes.itemDoubleClicked.connect(self.calendar_open_note);cl.addWidget(self.day_notes,1)
-        self.tray=QSystemTrayIcon(self.icon,self);self.tray.setToolTip(APP_NAME+' · 双击 F12 唤醒/隐藏')
+        self.tray=QSystemTrayIcon(self.icon,self);self.tray.setToolTip(APP_NAME+' · Ctrl+Alt+N 或双击 F12 唤醒/隐藏')
         menu=QMenu();a=menu.addAction('显示主窗口');a.triggered.connect(self.show_normal)
         b=menu.addAction('新建便签');b.triggered.connect(self.new_note)
         menu.addSeparator();a=menu.addAction('退出程序');a.triggered.connect(self.real_quit)
         self.tray.setContextMenu(menu);self.tray.activated.connect(self.tray_activated);self.tray.show()
         self.notice=QTimer(self);self.notice.timeout.connect(self.check_reminders);self.notice.start(20000)
-        self.hotkey=HotkeyFilter();self.hotkey.triggered=self.on_f12;self.f12_last=0
+        self.hotkey=HotkeyFilter();self.hotkey.triggered=self.on_hotkey;self.f12_last=0
+        self.registered_hotkeys=[]
         if sys.platform=='win32':
             QApplication.instance().installNativeEventFilter(self.hotkey)
-            # MOD_NOREPEAT (0x4000), VK_F12 (0x7B). Hotkey works while unfocused.
-            result=ctypes.windll.user32.RegisterHotKey(None,0xB120,0x4000,0x7B)
-            if not result:QTimer.singleShot(2500,lambda:self.tray.showMessage(APP_NAME,'F12 已被其他软件占用；请关闭冲突热键。'))
+            user32=ctypes.windll.user32
+            # MOD_NOREPEAT=0x4000; MOD_CONTROL=0x2; MOD_ALT=0x1
+            # F12 is optional because browsers, debuggers and other utilities may claim it.
+            for hotkey_id, modifiers, vk in ((0xB120,0x4000,0x7B),(0xB121,0x4000|0x2|0x1,0x4E)):
+                if user32.RegisterHotKey(None,hotkey_id,modifiers,vk):
+                    self.registered_hotkeys.append(hotkey_id)
+            if 0xB120 not in self.registered_hotkeys:
+                QTimer.singleShot(2500,lambda:self.tray.showMessage(APP_NAME,
+                    'F12 热键不可用。请使用 Ctrl+Alt+N 唤醒或隐藏，或双击托盘图标。'))
+            if not self.registered_hotkeys:
+                QTimer.singleShot(3000,lambda:self.tray.showMessage(APP_NAME,
+                    '全局热键均被占用，请从系统托盘双击图标或右键选择显示主窗口。'))
         self.style_app()
         if not self.store.all('all'):self.store.add('欢迎使用牛马便签','工作')
         self.reload_list();self.refresh_calendar()
@@ -543,9 +553,13 @@ class MainWindow(QMainWindow):
                 self.store.update(n['id'],reminded=1)
                 self.tray.showMessage('⏰ '+n['title'],n['content'][:160] or '设定时间已到',QSystemTrayIcon.MessageIcon.Information,10000)
                 QApplication.beep()
-    def on_f12(self):
+    def on_hotkey(self,hotkey_id):
+        if hotkey_id==0xB121:
+            self.f12_last=0
+            self.toggle_show()
+            return
         now=time.monotonic()
-        if now-self.f12_last<=0.55:self.f12_last=0;self.toggle_show()
+        if now-self.f12_last<=0.7:self.f12_last=0;self.toggle_show()
         else:self.f12_last=now
     def toggle_show(self):
         if self.isVisible():self.hide_all()
@@ -564,13 +578,15 @@ class MainWindow(QMainWindow):
     def closeEvent(self,e):
         self.editor.save()
         if not self.quit_real:
-            e.ignore();self.hide_all();self.tray.showMessage(APP_NAME,'程序已隐藏到托盘。连续按两次 F12 可唤醒。',QSystemTrayIcon.MessageIcon.Information,2500)
+            e.ignore();self.hide_all();self.tray.showMessage(APP_NAME,'程序已隐藏到托盘。按 Ctrl+Alt+N 或连续按两次 F12 可唤醒。',QSystemTrayIcon.MessageIcon.Information,2500)
         else:e.accept()
     def real_quit(self):
         self.editor.save()
         for sticky in list(self.stickies.values()):sticky.close()
         self.quit_real=True
-        if sys.platform=='win32':ctypes.windll.user32.UnregisterHotKey(None,0xB120)
+        if sys.platform=='win32':
+            for hotkey_id in self.registered_hotkeys:
+                ctypes.windll.user32.UnregisterHotKey(None,hotkey_id)
         self.tray.hide();QApplication.quit()
 
 
