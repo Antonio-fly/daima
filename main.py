@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QFrame, QHBox
     QTextBrowser, QGraphicsOpacityEffect, QDateEdit)
 
 from calendar_page import CalendarPage
+from desktop_tools import DesktopTools, TodayBoard
 from calendar_store import lunar_labels, official_day
 
 APP_NAME = '牛马便签'
@@ -78,14 +79,16 @@ class Store:
             self.conn.execute("UPDATE notes SET note_date=substr(created,1,10) WHERE note_date=''")
             self.conn.commit()
         self.conn.execute("UPDATE notes SET note_date=substr(created,1,10) WHERE note_date=''")
+        if 'board_lane' not in columns:
+            self.conn.execute("ALTER TABLE notes ADD COLUMN board_lane TEXT NOT NULL DEFAULT 'doing'")
         self.conn.commit()
 
-    def add(self, title='新便签', category='工作', color=None, note_date=None):
+    def add(self, title='新便签', category='工作', color=None, note_date=None, board_lane='doing'):
         nid = uuid.uuid4().hex
         now = datetime.now().isoformat(timespec='seconds')
         chosen=note_date or now[:10]
-        self.conn.execute('INSERT INTO notes(id,title,category,color,note_date,created,updated) VALUES(?,?,?,?,?,?,?)',
-                          (nid,title,category,color or NOTE_COLORS[len(self.all()) % len(NOTE_COLORS)],chosen,now,now))
+        self.conn.execute('INSERT INTO notes(id,title,category,color,note_date,created,updated,board_lane) VALUES(?,?,?,?,?,?,?,?)',
+                          (nid,title,category,color or NOTE_COLORS[len(self.all()) % len(NOTE_COLORS)],chosen,now,now,board_lane))
         self.conn.commit()
         return nid
 
@@ -115,7 +118,7 @@ class Store:
 
     def update(self, nid, **fields):
         valid = {'title','html','content','category','tags','color','opacity','pinned','archived','trashed','note_date',
-                 'reminder','reminded','x','y','w','h'}
+                 'reminder','reminded','x','y','w','h','board_lane'}
         fields = {k:v for k,v in fields.items() if k in valid}
         if not fields: return
         fields['updated'] = datetime.now().isoformat(timespec='seconds')
@@ -536,7 +539,7 @@ class MainWindow(QMainWindow):
         motto=QLabel('让每一件小事都闪闪发光');motto.setStyleSheet('color:#547557');sl.addWidget(motto)
         self.search=QLineEdit();self.search.setPlaceholderText('🔎 搜索便签 / 标签 / 内容');self.search.textChanged.connect(self.reload_list);sl.addWidget(self.search)
         self.cat_buttons={}
-        for label,callback in [('▦  日历视图',self.show_calendar),('▤  全部笔记',lambda:self.change_mode('active')),
+        for label,callback in [('▥  今日便签墙',self.show_board),('▦  日历视图',self.show_calendar),('▤  全部笔记',lambda:self.change_mode('active')),
             ('☆  星标收藏',self.favorites),('◷  最近使用',lambda:self.change_mode('active')),
             ('▣  归档',lambda:self.change_mode('archive')),('▤  回收站',lambda:self.change_mode('trash'))]:
             b=QPushButton(label);b.setObjectName('nav');b.clicked.connect(callback);sl.addWidget(b)
@@ -575,6 +578,18 @@ class MainWindow(QMainWindow):
         self.calendar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.calendar.customContextMenuRequested.connect(self.calendar_context_menu)
         self.day_notes=QListWidget();self.day_notes.itemDoubleClicked.connect(self.calendar_open_note);cl.addWidget(self.day_notes,1)
+        self.board = TodayBoard(self)
+        self.stack.addWidget(self.board)
+        self.desktop = DesktopTools(self)
+        companion = QPushButton('🐮  牛马搭档')
+        companion.setObjectName('nav')
+        companion.setCheckable(True)
+        companion.setChecked(self.desktop.companion_action.isChecked())
+        companion.toggled.connect(self.desktop.companion_action.setChecked)
+        # Closing from the desktop card synchronizes the sidebar and tray.
+        self.desktop.companion_action.changed.connect(
+            lambda: companion.setChecked(self.desktop.companion_action.isChecked()))
+        sl.insertWidget(sl.count() - 2, companion)
         self.tray=QSystemTrayIcon(self.icon,self)
         menu=QMenu();a=menu.addAction('显示主窗口');a.triggered.connect(self.show_normal)
         b=menu.addAction('新建便签');b.triggered.connect(lambda: self.new_note(use_calendar=False))
@@ -582,6 +597,13 @@ class MainWindow(QMainWindow):
         reminders = QAction('日程提醒中心', self)
         menu.insertAction(menu.actions()[-1], reminders)
         reminders.triggered.connect(self.calendar_page.notifications)
+        menu.insertAction(a, self.desktop.companion_action)
+        deadline_action = QAction('截止日贴纸', self)
+        deadline_action.triggered.connect(self.desktop.manage)
+        menu.insertAction(a, deadline_action)
+        board_action = QAction('今日便签墙', self)
+        board_action.triggered.connect(lambda: (self.show_normal(), self.show_board()))
+        menu.insertAction(a, board_action)
         self.tray.setContextMenu(menu);self.tray.activated.connect(self.tray_activated);self.tray.show()
         self.notice=QTimer(self);self.notice.timeout.connect(self.check_reminders);self.notice.start(20000)
         self.hotkey = HotkeyFilter()
@@ -611,6 +633,7 @@ class MainWindow(QMainWindow):
         if not self.store.all('all'):self.store.add('欢迎使用牛马便签','工作')
         self.reload_list();self.refresh_calendar()
         self.show_calendar()
+        QTimer.singleShot(0, self.desktop.start)
         QTimer.singleShot(0, self.calendar_page.fetch_subscription)
         QTimer.singleShot(0, self.calendar_page.check_notifications)
 
@@ -623,7 +646,7 @@ class MainWindow(QMainWindow):
         QPushButton{border:0;background:#ffffffad;border-radius:9px;padding:7px 10px;color:#2b422d;}
         QPushButton:hover{background:#c5e6bd;}
         QPushButton#nav{background:transparent;text-align:left;padding:10px 11px;}
-        QPushButton#nav:hover{background:#a5cb97;border-radius:9px;}
+        QPushButton#nav:hover,QPushButton#nav:checked{background:#a5cb97;border-radius:9px;}
         QPushButton#primary{background:#699e5a;color:white;font-weight:700;padding:10px 14px;}
         QPushButton#primary:hover{background:#477f3d;}
         QLineEdit,QComboBox,QDateTimeEdit{background:#ffffffc9;border:1px solid #d0e1cc;border-radius:8px;padding:8px;}
@@ -636,6 +659,12 @@ class MainWindow(QMainWindow):
         QCalendarWidget QAbstractItemView:enabled{background:#f5faf0;selection-background-color:#79b06b;selection-color:white;}
         QTextEdit{border:1px solid #d2e2cc;border-radius:10px;}
         ''')
+
+    def show_board(self):
+        if self.editor.save_timer.isActive():
+            self.editor.save()
+        self.board.refresh()
+        self.stack.setCurrentWidget(self.board)
 
     def show_calendar(self):self.stack.setCurrentIndex(1);self.refresh_calendar()
     def go_today(self):
@@ -696,11 +725,11 @@ class MainWindow(QMainWindow):
             if self.list.item(index).data(Qt.ItemDataRole.UserRole) == nid:
                 self.list.setCurrentRow(index)
                 return
-    def new_note(self, checked=False, note_date=None, *, use_calendar=True):
+    def new_note(self, checked=False, note_date=None, *, use_calendar=True, board_lane='doing'):
         if note_date is None and use_calendar and self.stack.currentIndex() == 1:
             note_date = self.calendar.selectedDate().toString('yyyy-MM-dd')
         category = self.selected_category if self.selected_category != '全部' else '工作'
-        nid = self.store.add('新便签', category, note_date=note_date)
+        nid = self.store.add('新便签', category, note_date=note_date, board_lane=board_lane)
         self.select_id(nid)
         self.refresh_calendar()
         self.editor.title.selectAll()
@@ -740,6 +769,8 @@ class MainWindow(QMainWindow):
             day=n['note_date']
             counts[day]=counts.get(day,0)+1
         self.calendar.set_note_counts(counts)
+        if hasattr(self, 'board') and self.stack.currentWidget() is self.board:
+            self.board.refresh()
         self.calendar_page.refresh()
         self.show_date_notes(self.calendar.selectedDate())
 
@@ -796,6 +827,7 @@ class MainWindow(QMainWindow):
         self.editor.save()
         for sticky in list(self.stickies.values()):sticky.close()
         self.quit_real=True
+        self.desktop.shutdown()
         self.tray.hide();QApplication.quit()
 
 

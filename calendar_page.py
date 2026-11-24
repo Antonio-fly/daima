@@ -706,9 +706,12 @@ class CalendarPage(QWidget):
         remove = box.addButton('删除', QMessageBox.ButtonRole.DestructiveRole)
         task = box.addButton('创建关联待办', QMessageBox.ButtonRole.ActionRole)
         template = box.addButton('保存为模板', QMessageBox.ButtonRole.ActionRole)
+        deadline = box.addButton('生成倒计时贴纸', QMessageBox.ButtonRole.ActionRole)
         box.exec()
         action = box.clickedButton()
-        if action == task:
+        if action == deadline:
+            self.owner.desktop.edit(occurrence=item)
+        elif action == task:
             self.edit_task(task=dict(title=event['title'], due=item.start.date().isoformat(),
                                      priority='普通', done=False, event_id=event['id']))
         elif action == template:
