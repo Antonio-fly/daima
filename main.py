@@ -11,10 +11,10 @@ import calendar
 import shutil
 import ctypes
 from pathlib import Path
-from datetime import datetime, date
+from datetime import datetime
 from html import escape
 
-from PySide6.QtCore import Qt, QDate, QDateTime, QTimer, QSize, QEvent, QObject, QAbstractNativeEventFilter, Signal
+from PySide6.QtCore import Qt, QDate, QDateTime, QTimer, QSize, QEvent, QObject, QAbstractNativeEventFilter, QSignalBlocker, Signal
 from PySide6.QtGui import (QIcon, QColor, QFont, QTextCharFormat, QTextCursor, QTextListFormat, QPainter,
                            QAction, QKeySequence, QTextImageFormat, QGuiApplication)
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QFrame, QHBoxLayout, QVBoxLayout,
@@ -23,6 +23,9 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QFrame, QHBox
     QFileDialog, QSystemTrayIcon, QStyle, QToolBar, QDialog, QDialogButtonBox, QFormLayout,
     QSpinBox, QSlider, QCheckBox, QScrollArea, QDateTimeEdit, QStackedWidget, QFontComboBox,
     QTextBrowser, QGraphicsOpacityEffect, QDateEdit)
+
+from calendar_page import CalendarPage
+from calendar_store import lunar_labels, official_day
 
 APP_NAME = '牛马便签'
 CATEGORIES = [('工作','#33a2e6'),('生活','#43ad5c'),('学习','#9d65dd'),('待办','#f9ac23'),('灵感','#ef7094'),('个人成长','#f1c841')]
@@ -86,6 +89,13 @@ class Store:
         self.conn.commit()
         return nid
 
+    def add_batch(self, title, html, content, days):
+        now = datetime.now().isoformat(timespec='seconds')
+        with self.conn:
+            self.conn.executemany(
+                'INSERT INTO notes(id,title,html,content,note_date,created,updated) VALUES(?,?,?,?,?,?,?)',
+                [(uuid.uuid4().hex, title, html, content, day.isoformat(), now, now) for day in days])
+
     def get(self, nid):
         r = self.conn.execute('SELECT * FROM notes WHERE id=?',(nid,)).fetchone()
         return dict(r) if r else None
@@ -136,10 +146,74 @@ class HotkeyFilter(QAbstractNativeEventFilter):
             _fields_ = [('hwnd',wintypes.HWND),('message',wintypes.UINT),('wParam',wintypes.WPARAM),
                         ('lParam',wintypes.LPARAM),('time',wintypes.DWORD),('pt',wintypes.POINT)]
         m = MSG.from_address(int(message))
-        if m.message == 0x0312 and m.wParam in (0xB120, 0xB121):
+        if m.message == 0x0312 and m.wParam == 0xB121:
             if self.triggered: self.triggered(int(m.wParam))
             return True,0
         return False,0
+
+
+class F12Listener(QObject):
+    double_pressed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.handle = None
+        self.is_down = False
+        self.last_press = None
+
+    def observe(self, pressed, now):
+        if pressed and not self.is_down:
+            if self.last_press is not None and now - self.last_press <= 0.7:
+                self.last_press = None
+                self.double_pressed.emit()
+            else:
+                self.last_press = now
+        self.is_down = pressed
+
+    def start(self):
+        from ctypes import wintypes
+
+        class KeyboardEvent(ctypes.Structure):
+            _fields_ = [('vk', wintypes.DWORD), ('scan', wintypes.DWORD),
+                        ('flags', wintypes.DWORD), ('time', wintypes.DWORD),
+                        ('extra', ctypes.c_size_t)]
+
+        # Hook pointers and LRESULT must be pointer-sized on 64-bit Windows.
+        callback_type = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
+                                           wintypes.WPARAM, wintypes.LPARAM)
+        user32 = ctypes.windll.user32
+        call_next = user32.CallNextHookEx
+        call_next.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+        call_next.restype = ctypes.c_ssize_t
+
+        @callback_type
+        def keyboard_event(code, message, address):
+            if code == 0:
+                event = KeyboardEvent.from_address(address)
+                if event.vk == 0x7B and not event.flags & 0x10:  # VK_F12, physical input
+                    self.observe(not bool(event.flags & 0x80), time.monotonic())
+            return call_next(None, code, message, address)
+
+        # Keep the callback alive until the hook is removed.
+        self.callback = keyboard_event
+        get_module = ctypes.windll.kernel32.GetModuleHandleW
+        get_module.argtypes = (wintypes.LPCWSTR,)
+        get_module.restype = wintypes.HMODULE
+        install = user32.SetWindowsHookExW
+        install.argtypes = (ctypes.c_int, callback_type, wintypes.HMODULE, wintypes.DWORD)
+        install.restype = wintypes.HANDLE
+        self.handle = install(13, self.callback, get_module(None), 0)  # WH_KEYBOARD_LL
+        return bool(self.handle)
+
+    def stop(self):
+        if self.handle:
+            from ctypes import wintypes
+
+            remove = ctypes.windll.user32.UnhookWindowsHookEx
+            remove.argtypes = (wintypes.HANDLE,)
+            remove.restype = wintypes.BOOL
+            if remove(self.handle):
+                self.handle = None
 
 
 class Sticky(QWidget):
@@ -183,6 +257,7 @@ class Sticky(QWidget):
             self.owner.store.update(self.nid,title=self.title.text(),html=self.text.toHtml(),content=self.text.toPlainText(),
                                     x=self.x(),y=self.y(),w=self.width(),h=self.height())
             self.owner.reload_list(keep=True)
+            self.owner.refresh_calendar()
     def toggle_top(self):
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint,not bool(self.windowFlags() & Qt.WindowType.WindowStaysOnTopHint))
         self.show()
@@ -392,21 +467,56 @@ class NoteCalendar(QCalendarWidget):
     def __init__(self,parent=None):
         super().__init__(parent)
         self.note_counts={}
+        self.batch_range = None
+        self.show_official = True
+        self.event_days = set()
 
-    def paintCell(self,painter,rect,day):
-        super().paintCell(painter,rect,day)
-        count=self.note_counts.get(day.toString('yyyy-MM-dd'),0)
-        if not count:return
+    def set_note_counts(self, counts):
+        for key in self.note_counts.keys() | counts.keys():
+            if bool(self.note_counts.get(key)) == bool(counts.get(key)):
+                continue
+            fmt = QTextCharFormat()
+            if key in counts:
+                fmt.setBackground(QColor('#d5edcd'))
+                fmt.setForeground(QColor('#20472c'))
+                fmt.setFontWeight(QFont.Weight.Bold)
+            self.setDateTextFormat(QDate.fromString(key, 'yyyy-MM-dd'), fmt)
+        self.note_counts = counts
+        self.updateCells()
+
+    def paintCell(self, painter, rect, day):
+        super().paintCell(painter, rect, day)
+        key = day.toString('yyyy-MM-dd')
+        count = self.note_counts.get(key, 0)
+        local_day = day.toPython()
+        lunar, term, festival = lunar_labels(local_day)
+        holiday = official_day(local_day) if self.show_official else ''
+        selected = day == self.selectedDate()
         painter.save()
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing,True)
-        # Small colored count badge in top right; remains visible on selected dates.
-        badge=rect.adjusted(rect.width()-33,4,-4,-rect.height()+23)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor('#368b50'))
-        painter.drawRoundedRect(badge,8,8)
-        painter.setPen(QColor('#ffffff'))
-        font=painter.font();font.setBold(True);font.setPointSize(8);painter.setFont(font)
-        painter.drawText(badge,Qt.AlignmentFlag.AlignCenter,str(count) if count<100 else '99+')
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        font = painter.font()
+        font.setBold(bool(count or holiday))
+        font.setPointSize(8)
+        painter.setFont(font)
+        suffix = holiday or term or festival or lunar
+        if key in self.event_days:
+            suffix = '• ' + suffix
+        available = rect.adjusted(4, rect.height() - 16, -4, -2)
+        suffix = painter.fontMetrics().elidedText(suffix, Qt.TextElideMode.ElideRight, available.width())
+        if rect.height() >= 35:
+            painter.setPen(QColor('#ffffff' if selected else '#a04431' if holiday else '#425c52'))
+            painter.drawText(available, Qt.AlignmentFlag.AlignCenter, suffix)
+        if self.batch_range and self.batch_range[0] <= local_day <= self.batch_range[1]:
+            painter.setPen(QColor('#235bb5'))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(rect.adjusted(1, 1, -2, -2), 4, 4)
+        if count:
+            badge = rect.adjusted(rect.width() - 29, 3, -3, -rect.height() + 19)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor('#27683a'))
+            painter.drawRoundedRect(badge, 7, 7)
+            painter.setPen(QColor('#ffffff'))
+            painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, str(count) if count < 100 else '99+')
         painter.restore()
 
 
@@ -449,15 +559,15 @@ class MainWindow(QMainWindow):
         splitter.addWidget(left)
         self.editor=Editor(self);splitter.addWidget(self.editor)
         splitter.setSizes([250,720]);splitter.setStretchFactor(1,1)
-        calpage=QWidget();self.stack.addWidget(calpage);cl=QVBoxLayout(calpage);cl.setContentsMargins(12,0,12,12)
-        chead=QHBoxLayout();cl.addLayout(chead)
-        title=QLabel('日历视图');title.setObjectName('heading');chead.addWidget(title);chead.addStretch()
-        today=QPushButton('今天');today.clicked.connect(self.go_today);chead.addWidget(today)
         self.calendar=NoteCalendar();self.calendar.setGridVisible(True);self.calendar.setNavigationBarVisible(True)
+        self.calendar.setMinimumHeight(325)
         self.calendar.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
-        self.calendar.selectionChanged.connect(lambda:self.show_date_notes(self.calendar.selectedDate()))
-        self.calendar.currentPageChanged.connect(lambda *_:self.refresh_calendar())
-        cl.addWidget(self.calendar,2)
+        self.calendar.currentPageChanged.connect(self.calendar_page_changed)
+        self.calendar.activated.connect(self.new_note_on_date)
+        self.calendar_page = CalendarPage(self, self.calendar)
+        self.stack.addWidget(self.calendar_page)
+        self.calendar.selectionChanged.connect(lambda: self.show_date_notes(self.calendar.selectedDate()))
+        cl = self.calendar_page.notes_layout
         daybar=QHBoxLayout();cl.addLayout(daybar)
         self.day_heading=QLabel('当日便签事项');daybar.addWidget(self.day_heading);daybar.addStretch()
         self.add_day=QPushButton('＋ 在所选日期新建便签');self.add_day.setObjectName('primary')
@@ -465,32 +575,44 @@ class MainWindow(QMainWindow):
         self.calendar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.calendar.customContextMenuRequested.connect(self.calendar_context_menu)
         self.day_notes=QListWidget();self.day_notes.itemDoubleClicked.connect(self.calendar_open_note);cl.addWidget(self.day_notes,1)
-        self.tray=QSystemTrayIcon(self.icon,self);self.tray.setToolTip(APP_NAME+' · Ctrl+Alt+N 或双击 F12 唤醒/隐藏')
+        self.tray=QSystemTrayIcon(self.icon,self)
         menu=QMenu();a=menu.addAction('显示主窗口');a.triggered.connect(self.show_normal)
-        b=menu.addAction('新建便签');b.triggered.connect(self.new_note)
+        b=menu.addAction('新建便签');b.triggered.connect(lambda: self.new_note(use_calendar=False))
         menu.addSeparator();a=menu.addAction('退出程序');a.triggered.connect(self.real_quit)
+        reminders = QAction('日程提醒中心', self)
+        menu.insertAction(menu.actions()[-1], reminders)
+        reminders.triggered.connect(self.calendar_page.notifications)
         self.tray.setContextMenu(menu);self.tray.activated.connect(self.tray_activated);self.tray.show()
         self.notice=QTimer(self);self.notice.timeout.connect(self.check_reminders);self.notice.start(20000)
-        self.hotkey=HotkeyFilter();self.hotkey.triggered=self.on_hotkey;self.f12_last=0
-        self.registered_hotkeys=[]
-        if sys.platform=='win32':
-            QApplication.instance().installNativeEventFilter(self.hotkey)
-            user32=ctypes.windll.user32
-            # MOD_NOREPEAT=0x4000; MOD_CONTROL=0x2; MOD_ALT=0x1
-            # F12 is optional because browsers, debuggers and other utilities may claim it.
-            for hotkey_id, modifiers, vk in ((0xB120,0x4000,0x7B),(0xB121,0x4000|0x2|0x1,0x4E)):
-                if user32.RegisterHotKey(None,hotkey_id,modifiers,vk):
-                    self.registered_hotkeys.append(hotkey_id)
-            if 0xB120 not in self.registered_hotkeys:
-                QTimer.singleShot(2500,lambda:self.tray.showMessage(APP_NAME,
-                    'F12 热键不可用。请使用 Ctrl+Alt+N 唤醒或隐藏，或双击托盘图标。'))
-            if not self.registered_hotkeys:
-                QTimer.singleShot(3000,lambda:self.tray.showMessage(APP_NAME,
-                    '全局热键均被占用，请从系统托盘双击图标或右键选择显示主窗口。'))
+        self.hotkey = HotkeyFilter()
+        self.hotkey.triggered = self.toggle_from_alternate_hotkey
+        self.f12 = F12Listener(self)
+        self.f12.double_pressed.connect(self.toggle_show, Qt.ConnectionType.QueuedConnection)
+        self.alternate_hotkey = False
+        shortcuts = []
+        if sys.platform == 'win32':
+            app = QApplication.instance()
+            app.installNativeEventFilter(self.hotkey)
+            app.aboutToQuit.connect(self.release_hotkeys)
+            user32 = ctypes.windll.user32
+            # MOD_NOREPEAT | MOD_CONTROL | MOD_ALT, VK_N
+            self.alternate_hotkey = bool(user32.RegisterHotKey(None, 0xB121, 0x4003, 0x4E))
+            if self.alternate_hotkey:
+                shortcuts.append('Ctrl+Alt+N')
+            if self.f12.start():
+                shortcuts.append('连续按两次 F12')
+            if len(shortcuts) < 2:
+                QTimer.singleShot(2500, lambda: self.tray.showMessage(
+                    APP_NAME, '部分全局快捷键不可用。' + self.wake_hint))
+        shortcuts.append('双击托盘图标')
+        self.wake_hint = '可用 ' + '、'.join(shortcuts) + ' 唤醒或隐藏。'
+        self.tray.setToolTip(APP_NAME + ' · ' + self.wake_hint)
         self.style_app()
         if not self.store.all('all'):self.store.add('欢迎使用牛马便签','工作')
         self.reload_list();self.refresh_calendar()
         self.show_calendar()
+        QTimer.singleShot(0, self.calendar_page.fetch_subscription)
+        QTimer.singleShot(0, self.calendar_page.check_notifications)
 
     def style_app(self):
         self.setStyleSheet('''
@@ -520,12 +642,25 @@ class MainWindow(QMainWindow):
         self.calendar.setCurrentPage(QDate.currentDate().year(),QDate.currentDate().month())
         self.calendar.setSelectedDate(QDate.currentDate())
         self.show_date_notes(self.calendar.selectedDate())
-    def calendar_context_menu(self,point):
-        menu=QMenu(self)
-        menu.addAction('在选中日期新建便签',self.new_calendar_note)
+    def calendar_page_changed(self, year, month):
+        selected = self.calendar.selectedDate()
+        if (selected.year(), selected.month()) != (year, month):
+            first = QDate(year, month, 1)
+            self.calendar.setSelectedDate(first.addDays(min(selected.day(), first.daysInMonth()) - 1))
+
+    def calendar_context_menu(self, point):
+        day = self.calendar.selectedDate()
+        menu = QMenu(self)
+        menu.addAction('在 ' + day.toString('yyyy-MM-dd') + ' 新建便签',
+                       lambda: self.new_note_on_date(day))
         menu.exec(self.calendar.mapToGlobal(point))
+
     def new_calendar_note(self):
-        self.new_note(note_date=self.calendar.selectedDate().toString('yyyy-MM-dd'))
+        self.new_note_on_date(self.calendar.selectedDate())
+
+    def new_note_on_date(self, day):
+        self.new_note(note_date=day.toString('yyyy-MM-dd'))
+
     def change_mode(self,mode):
         self.mode=mode;self.selected_category='全部';self.heading.setText({'active':'全部笔记','archive':'归档','trash':'回收站'}[mode]);self.stack.setCurrentIndex(0);self.reload_list()
     def favorites(self):self.change_mode('active');self.reload_list(favorites=True)
@@ -546,17 +681,31 @@ class MainWindow(QMainWindow):
         if self.list.count() and not keep:self.on_select(self.list.currentItem())
     def on_select(self,current,*_):
         if current:self.editor.load_note(current.data(Qt.ItemDataRole.UserRole))
-    def select_id(self,nid):
-        self.change_mode('active')
-        for i in range(self.list.count()):
-            if self.list.item(i).data(Qt.ItemDataRole.UserRole)==nid:
-                self.list.setCurrentRow(i);return
-    def new_note(self,checked=False,note_date=None):
-        # Qt clicked(bool) passes checked; ignore it to keep sidebar 'new' using today.
-        selected=note_date if isinstance(note_date,str) else date.today().isoformat()
-        category=self.selected_category if self.selected_category!='全部' else '工作'
-        nid=self.store.add('新便签',category,note_date=selected);self.mode='active';self.selected_category='全部';self.stack.setCurrentIndex(0)
-        self.reload_list();self.select_id(nid);self.editor.title.selectAll();self.editor.title.setFocus()
+    def select_id(self, nid):
+        note = self.store.get(nid)
+        if not note:
+            return
+        if self.editor.save_timer.isActive():
+            self.editor.save()
+        # An explicit open by ID must work even with a search or category filter.
+        with QSignalBlocker(self.search):
+            self.search.clear()
+        mode = 'trash' if note['trashed'] else 'archive' if note['archived'] else 'active'
+        self.change_mode(mode)
+        for index in range(self.list.count()):
+            if self.list.item(index).data(Qt.ItemDataRole.UserRole) == nid:
+                self.list.setCurrentRow(index)
+                return
+    def new_note(self, checked=False, note_date=None, *, use_calendar=True):
+        if note_date is None and use_calendar and self.stack.currentIndex() == 1:
+            note_date = self.calendar.selectedDate().toString('yyyy-MM-dd')
+        category = self.selected_category if self.selected_category != '全部' else '工作'
+        nid = self.store.add('新便签', category, note_date=note_date)
+        self.select_id(nid)
+        self.refresh_calendar()
+        self.editor.title.selectAll()
+        self.editor.title.setFocus()
+
     def move_to_trash(self,nid):
         n=self.store.get(nid)
         if not n:return
@@ -565,7 +714,7 @@ class MainWindow(QMainWindow):
             if confirm==QMessageBox.StandardButton.Yes:self.store.destroy(nid)
         else:self.store.update(nid,trashed=1)
         if nid in self.stickies:self.stickies[nid].close()
-        self.editor.nid=None;self.reload_list()
+        self.editor.nid=None;self.reload_list();self.refresh_calendar()
     def keyPressEvent(self,event):
         if event.matches(QKeySequence.StandardKey.New):self.new_note()
         elif event.key()==Qt.Key.Key_Delete and self.mode=='trash' and self.list.hasFocus():self.move_to_trash(self.editor.nid)
@@ -579,7 +728,7 @@ class MainWindow(QMainWindow):
     def archive_current(self):
         if self.editor.nid:self.store.update(self.editor.nid,archived=1);self.reload_list()
     def restore_current(self):
-        if self.editor.nid:self.store.update(self.editor.nid,trashed=0,archived=0);self.reload_list()
+        if self.editor.nid:self.store.update(self.editor.nid,trashed=0,archived=0);self.reload_list();self.refresh_calendar()
     def open_sticky(self,nid):
         if nid in self.stickies:self.stickies[nid].show();self.stickies[nid].raise_();return
         n=Sticky(self,nid);self.stickies[nid]=n;n.show()
@@ -590,8 +739,8 @@ class MainWindow(QMainWindow):
         for n in self.store.all('all'):
             day=n['note_date']
             counts[day]=counts.get(day,0)+1
-        self.calendar.note_counts=counts
-        self.calendar.updateCells()
+        self.calendar.set_note_counts(counts)
+        self.calendar_page.refresh()
         self.show_date_notes(self.calendar.selectedDate())
 
     def show_date_notes(self,qdate):
@@ -606,22 +755,26 @@ class MainWindow(QMainWindow):
             self.day_notes.addItem(it)
     def calendar_open_note(self,it):self.select_id(it.data(Qt.ItemDataRole.UserRole))
     def check_reminders(self):
+        self.calendar_page.check_notifications()
         now=datetime.now().strftime('%Y-%m-%d %H:%M')
         for n in self.store.all('active'):
             if n['reminder'] and n['reminder']<=now and not n['reminded']:
                 self.store.update(n['id'],reminded=1)
                 self.tray.showMessage('⏰ '+n['title'],n['content'][:160] or '设定时间已到',QSystemTrayIcon.MessageIcon.Information,10000)
                 QApplication.beep()
-    def on_hotkey(self,hotkey_id):
-        if hotkey_id==0xB121:
-            self.f12_last=0
-            self.toggle_show()
-            return
-        now=time.monotonic()
-        if now-self.f12_last<=0.7:self.f12_last=0;self.toggle_show()
-        else:self.f12_last=now
+    def toggle_from_alternate_hotkey(self, _hotkey_id):
+        self.f12.last_press = None
+        self.toggle_show()
+
+    def release_hotkeys(self):
+        self.f12.stop()
+        if self.alternate_hotkey:
+            ctypes.windll.user32.UnregisterHotKey(None, 0xB121)
+            self.alternate_hotkey = False
+        QApplication.instance().removeNativeEventFilter(self.hotkey)
+
     def toggle_show(self):
-        if self.isVisible():self.hide_all()
+        if self.isVisible() and not self.isMinimized():self.hide_all()
         else:self.show_normal()
     def hide_all(self):
         self.hidden_stickies=[nid for nid,note in self.stickies.items() if note.isVisible()]
@@ -637,15 +790,12 @@ class MainWindow(QMainWindow):
     def closeEvent(self,e):
         self.editor.save()
         if not self.quit_real:
-            e.ignore();self.hide_all();self.tray.showMessage(APP_NAME,'程序已隐藏到托盘。按 Ctrl+Alt+N 或连续按两次 F12 可唤醒。',QSystemTrayIcon.MessageIcon.Information,2500)
+            e.ignore();self.hide_all();self.tray.showMessage(APP_NAME,'程序已隐藏到托盘。'+self.wake_hint,QSystemTrayIcon.MessageIcon.Information,2500)
         else:e.accept()
     def real_quit(self):
         self.editor.save()
         for sticky in list(self.stickies.values()):sticky.close()
         self.quit_real=True
-        if sys.platform=='win32':
-            for hotkey_id in self.registered_hotkeys:
-                ctypes.windll.user32.UnregisterHotKey(None,hotkey_id)
         self.tray.hide();QApplication.quit()
 
 
